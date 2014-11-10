@@ -1,0 +1,260 @@
+// A  PK: orderId
+		builder.setBolt("orders", new OrderBolt(zkString, zkRoot, joinConf), 10)
+										.fieldsGrouping("spoutOrder", new Fields("_message_id"));
+		 
+		// B PK : orderId detId Sku
+		builder.setBolt("orders-detail", new OrderDetailBolt(zkString, zkRoot, joinConf), 10)
+										.fieldsGrouping("spoutOrderDetail", new Fields("_message_id"));
+		
+		// C PK: detId
+		builder.setBolt("orders-detail2", new OrderDetail2Bolt(zkString, zkRoot, joinConf), 10)
+										.fieldsGrouping("spoutOrderDetail2", new Fields("_message_id"));
+		
+		// BC =>D
+		builder.setBolt("detail-combin", new DetailCombinBolt(zkString, zkRoot, joinConf), 10)
+		.fieldsGrouping("orders-detail", new Fields("detId"))
+		.fieldsGrouping("orders-detail2", new Fields("detId"));
+		
+		// Emit
+		builder.setBolt("merge", new OrderMergeBolt(zkString, zkRoot,topicName), 10)
+		.fieldsGrouping("orders", new Fields("key"))
+		.fieldsGrouping("detail-combin", new Fields("key"));
+
+		
+		Config conf = new Config();
+		if (isRunInLocal) {
+			LocalCluster cluster = new LocalCluster();
+			cluster.submitTopology(topologyName, conf, builder.createTopology());
+		} else {
+			conf.setDebug(debugEnabled);
+			conf.setNumWorkers(numWorker);
+			conf.setNumAckers(numAcker);
+			conf.setMaxSpoutPending(spoutMaxPending);
+			conf.setMessageTimeoutSecs(messageTimeoutSecond);
+			StormSubmitter.submitTopology(topologyName, conf,
+					builder.createTopology());
+		}
+		
+	}
+	
+	private static void printTopo() {
+		System.out.println("A    B    C");
+		System.out.println("-    -    -");
+		System.out.println(" -    -  -");
+		System.out.println("  -     -");
+		System.out.println("   -    D");
+		System.out.println("    -  -");
+		System.out.println("      E");
+	}
+	
+	[=======================
+	
+	
+	package com.jd.rdw.real_time_new.bolt;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Type;
+import java.util.List;
+import java.util.Map;
+
+import org.apache.log4j.Logger;
+
+import backtype.storm.task.TopologyContext;
+import backtype.storm.topology.BasicOutputCollector;
+import backtype.storm.topology.OutputFieldsDeclarer;
+import backtype.storm.topology.base.BaseBasicBolt;
+import backtype.storm.tuple.Fields;
+import backtype.storm.tuple.Tuple;
+import backtype.storm.tuple.Values;
+
+import com.google.common.reflect.TypeToken;
+import com.jd.rdw.real_time_dw.bean.DetCombin;
+import com.jd.rdw.real_time_new.bean.Index;
+import com.jd.rdw.real_time_new.bean.OrderBaseInfo;
+import com.jd.rdw.real_time_new.service.ModifyOpt;
+import com.jd.rdw.real_time_new.utils.HBaseUtils;
+import com.jd.rdw.real_time_new.utils.StringUtils;
+
+/**
+ * 
+ * @author zhangkai3
+ *
+ */
+public class OrderBolt extends BaseBasicBolt implements ModifyOpt {
+	
+	public static Logger LOG = Logger.getLogger(OrderBolt.class);
+	private static final long serialVersionUID = -3475498475239126205L;
+	private Type type ;
+	private HBaseUtils hu;  
+	private String zkstring;
+	private String zkroot;
+	private Map<String, Object> joinConf;
+	public OrderBolt(String zkstring, String zkroot,Map<String, Object> joinConf) {
+		this.zkstring = zkstring;
+		this.zkroot = zkroot;
+		this.joinConf = joinConf;
+	}
+	
+	@Override
+	public void prepare(Map stormConf, TopologyContext context) {
+		type = new TypeToken<OrderBaseInfo>(){}.getType();
+		hu = new HBaseUtils(zkstring, zkroot);
+	}
+
+	@Override
+	public void execute(Tuple tuple, BasicOutputCollector collector) {
+		String rowKey = tuple.getStringByField("_primary_key");
+		if (StringUtils.isNullOrEmtry(rowKey)) {
+		      return;
+		}
+		OrderBaseInfo order = StringUtils.toGson().fromJson(tuple.getStringByField("_field_data"), type);
+		if(order == null || order.getId() == null) {
+			 LOG.error("order parse err:" + tuple.getStringByField("_field_data"));
+			return;
+		}	
+		process(order, collector);
+		
+		
+		// 检查已发送KEY组合表
+//		List<Index> sendKeyList = hu.getSendKeyList("A~" + order.getId(), "hb-tmp-order-index_send");
+//		
+//		if(sendKeyList != null && sendKeyList.size() != 0) {// 数据变更处理
+//			dataModifyOpt(order, sendKeyList, collector); 
+//			
+//		} else {
+//			normalProcess(order, collector);// 正常处理
+//		}
+	}
+
+	/**
+	 *      A    B     C
+	 *      -     -    -
+	 *       -     - -
+	 *        -     -
+	 *         -    D
+	 *          -  -
+	 *           --  
+	 * 			 E
+	 * A只和BC的组合索引D有关系
+	 * 新数据行，正常处理
+	 * @param order
+	 * @param collector
+	 */
+	private void process(OrderBaseInfo order, BasicOutputCollector collector) {
+		
+		Index isExsit = hu.indexIsExsit(order.getId(), "hb-tmp-order-base_index");// 先查索引
+		if(isExsit != null) {
+			OrderBaseInfo oldOrder = (OrderBaseInfo)hu.getObjectById(order.getId(),"tname"); // 根据key获取行
+			if(oldOrder == null) return;
+			order = merge(order, oldOrder); // 将旧的数值设置在新的对象上
+			
+		}
+		if(order == null) return;
+		
+		// save
+		hu.insertOrderBase(order, "hb-tmp-order-base");
+		// index 
+		hu.insertOrderIndex(order.getId(), order.getId(), "hb-tmp-order-base_index");
+		// emit
+		String key = "";
+		// BC组合索引KEY
+		List<Index> inList = hu.indexListIsExsit(order.getId(), "hb-tmp-detail-combin_index"); 
+		if(inList != null && inList.size() != 0) {
+			for (Index in : inList) {
+				key = in.getValue();
+				DetCombin combinDet = hu.getDetailCombin(key, "hb-tmp-detail-combin");
+				collector.emit(new Values(key, order, combinDet.getOdb(),combinDet.getOdc()));
+			}
+		} else if(joinConf.get("combin").equals("A|B|C") || joinConf.get("combin").equals("A|B&C")) {
+			collector.emit(new Values(order.getId(), order, null,null));
+		} 
+	}
+
+	/**
+	 * 合并对象
+	 * @param order
+	 * @param oldOrder
+	 * @return
+	 */
+	private OrderBaseInfo merge(OrderBaseInfo order, OrderBaseInfo oldOrder) {
+
+		Field[] fields = OrderBaseInfo.class.getDeclaredFields();
+		boolean diff = false;
+		for(Field field : fields) {
+			Field fieldX;
+			try {
+				fieldX = order.getClass().getDeclaredField(field.getName());
+				Field fieldY = oldOrder.getClass().getDeclaredField(field.getName());
+	            fieldX.setAccessible(true);
+	            fieldY.setAccessible(true);
+	            if(fieldY.get(oldOrder) != null) {
+	            	if(fieldY.get(oldOrder).equals(fieldY.get(order)) || diff) diff = true;
+	            	 fieldX.set(order, fieldX.get(order)!= null ? fieldX.get(order)+"|" + fieldY.get(oldOrder)
+	            			 : "empty|" + fieldY.get(oldOrder));
+	            }
+			} catch (NoSuchFieldException | IllegalArgumentException | SecurityException| IllegalAccessException e) {
+				e.printStackTrace();
+				return null;
+			}
+		}
+		return diff?order:null;
+	}
+	
+	
+	
+	
+	
+
+	/**
+	 * 数据变更情况处理
+	 * @param sendKeyList 
+	 * @param order 
+	 * @param collector 
+	 */
+	private void dataModifyOpt(OrderBaseInfo order, List<Index> sendKeyList, BasicOutputCollector collector) {
+		OrderBaseInfo oldOrder = diff(order); // diff 看是否是变更数据
+		if(oldOrder == null) return;
+		// 获取BC组合
+		List<Index> inList = hu.indexListIsExsit(order.getId(), "hb-tmp-detail-combin_index"); 
+		String key;
+		String oldO = oldOrder.getCreatedate() + "^" + oldOrder.getId() + "^" + oldOrder.getMemberid() + "^" + oldOrder.getCustomername();
+		if(inList != null && inList.size() != 0) {
+			for (Index in : inList) {
+				key = in.getValue();
+				DetCombin combinDet = hu.getDetailCombin(key, "hb-tmp-detail-combin");
+				collector.emit(new Values(key,order.getCreatedate(), order.getId(), order.getMemberid(), combinDet.getDetail(),combinDet.getSkuid(),combinDet.getSkuname(), combinDet.getPrice(),combinDet.getQuantity(),"A",oldO));
+			}
+		} else if(joinConf.get("combin").equals("A|B|C") || joinConf.get("combin").equals("A|B&C")) {
+			collector.emit(new Values(order.getId(), order.getCreatedate(), order.getId(), order.getMemberid(), null,null,null, null,null,"A",oldO));
+		} 
+	}
+
+	private OrderBaseInfo diff(OrderBaseInfo order) {
+		OrderBaseInfo oldOrder = (OrderBaseInfo)hu.getObjectById(order.getId(),"tname"); // 根据key获取行
+		return order.equals(oldOrder) ? null : oldOrder;  // 如果没有diff,则break
+	}
+
+	@Override
+	public void declareOutputFields(OutputFieldsDeclarer declarer) {
+		declarer.declare(new Fields("key","order","orderDet","orderDet2"));
+	}
+	
+
+	@Override
+	public Object judgeIndexIsExist() {
+		return null;
+	}
+
+	@Override
+	public void diff() {
+		// TODO Auto-generated method stub
+		
+	}
+
+}
+
+	
+	
+	
+	
+	
